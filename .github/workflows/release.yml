@@ -1,0 +1,149 @@
+name: release
+# Tests familiar, builds it for every platform, and on main publishes a signed
+# GitHub release (which installed copies update themselves from) and the
+# container image.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VERSION: 0.2.${{ github.run_number }}
+  PAWNIO_URL: https://github.com/namazso/PawnIO.Setup/releases/download/2.2.0/PawnIO_setup.exe
+  PAWNIO_SHA256: 1f519a22e47187f70a1379a48ca604981c4fcf694f4e65b734aaa74a9fba3032
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # Bundled into the Windows build: PawnIO's official 2.2.0 installer, signed by namazso.
+      - name: Fetch the PawnIO installer and check its hash
+        run: |
+          curl -sSfL -o pawnio/PawnIO_setup.exe "$PAWNIO_URL"
+          echo "$PAWNIO_SHA256  pawnio/PawnIO_setup.exe" | sha256sum -c -
+      - run: go vet ./...
+      - run: GOOS=windows go vet ./...
+      - run: go test -count=1 ./...
+
+  macos:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - name: Build for Apple silicon and Intel, then join them
+        run: |
+          flags="-s -w -X main.version=$VERSION"
+          CGO_ENABLED=1 GOARCH=arm64 go build -trimpath -ldflags "$flags" -o dist/familiar-arm64 .
+          CGO_ENABLED=1 GOARCH=amd64 CC="clang -arch x86_64" go build -trimpath -ldflags "$flags" -o dist/familiar-amd64 .
+          lipo -create -output dist/familiar-macos dist/familiar-arm64 dist/familiar-amd64
+          codesign --force --sign - dist/familiar-macos   # ad-hoc signature; Apple silicon won't run unsigned code
+          ./dist/familiar-macos version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: familiar-macos
+          path: dist/familiar-macos
+
+  windows:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Fetch the PawnIO installer and check its hash
+        run: |
+          curl -sSfL -o pawnio/PawnIO_setup.exe "$PAWNIO_URL"
+          echo "$PAWNIO_SHA256  pawnio/PawnIO_setup.exe" | sha256sum -c -
+      # -H=windowsgui: no console window at sign-in; it borrows a terminal's when run from one.
+      - run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=$VERSION" -o dist/familiar-windows.exe .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: familiar-windows
+          path: dist/familiar-windows.exe
+
+  linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: |
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o dist/familiar-linux-$arch .
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: familiar-linux
+          path: dist/familiar-linux-*
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.ref == 'refs/heads/main'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ env.VERSION }}
+          # Only main publishes; pull requests just check that it builds.
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: |
+            ghcr.io/oliviacpu/familiar:${{ env.VERSION }}
+            ghcr.io/oliviacpu/familiar:latest
+
+  release:
+    if: github.ref == 'refs/heads/main'
+    needs: [macos, windows, linux, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums, signed with the release key
+        env:
+          FAMILIAR_SIGNING_KEY: ${{ secrets.FAMILIAR_SIGNING_KEY }}
+        run: |
+          go build -o /tmp/familiar-sign ./cmd/familiar-sign
+          cd dist
+          sha256sum familiar-* > SHA256SUMS
+          /tmp/familiar-sign SHA256SUMS > SHA256SUMS.sig
+          cat SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" dist/* --title "familiar $VERSION" --target "$GITHUB_SHA" \
+            --notes "$(git log -1 --format=%B)"
