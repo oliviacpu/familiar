@@ -17,6 +17,7 @@ import (
 // can't measure that thing.
 type Reading struct {
 	CPU, Memory, Disk float64
+	DiskDrive         string        // the physical drive the main disk is on, "" if unknown
 	Disks             []DiskUse     // the other drives
 	Health            []DriveHealth // nil where the OS can't say
 	CPUTemp           *float64
@@ -33,6 +34,7 @@ type collector struct {
 	lastRecv, lastSent uint64
 	lastNet            time.Time
 	health             healthCache
+	drives             driveMap
 }
 
 func newCollector(cfg Config) *collector { return &collector{disk: cfg.DiskPath, disks: cfg.Disks} }
@@ -53,6 +55,14 @@ func (c *collector) Read(ctx context.Context) Reading {
 	// Looked for every time, so a drive plugged in shows up and one taken out goes unknown.
 	r.Disks = readDisks(ctx, findVolumes(ctx, runtime.GOOS, c.disk, c.disks))
 	r.Health = c.health.get(ctx)
+	// Which physical drive each volume is on, so its sensor can carry that
+	// drive's health: a failing SSD flags every letter on it.
+	if len(r.Health) > 0 {
+		r.DiskDrive = c.drives.of(c.disk)
+		for i := range r.Disks {
+			r.Disks[i].Drive = c.drives.of(r.Disks[i].Path)
+		}
+	}
 	if bt, err := host.BootTimeWithContext(ctx); err == nil && bt > 0 {
 		r.Boot = time.Unix(int64(bt), 0)
 	}

@@ -248,3 +248,49 @@ func parseDiskutilInfo(id, out string) DriveHealth {
 	}
 	return d
 }
+
+// driveAttributes is the health of the drive a volume is on, for that volume's
+// sensor: `problem` (true when the drive reports trouble), `health` (what it
+// says) and `drive` (which one). nil when the drive or its health isn't known.
+func driveAttributes(ds []DriveHealth, drive string) map[string]any {
+	if drive == "" {
+		return nil
+	}
+	for _, d := range ds {
+		if d.Device == drive {
+			return map[string]any{"drive": d.Device, "problem": d.Problem, "health": d.Status}
+		}
+	}
+	return nil
+}
+
+// driveMap remembers which physical drive each mount point is on: that only
+// changes when a drive is re-partitioned, and asking costs a system call or,
+// on a Mac, a diskutil run.
+type driveMap struct{ m map[string]string }
+
+func (d *driveMap) of(mount string) string {
+	if d.m == nil {
+		d.m = map[string]string{}
+	}
+	if v, ok := d.m[mount]; ok {
+		return v
+	}
+	v := volumeDrive(mount)
+	d.m[mount] = v
+	return v
+}
+
+var physicalStore = regexp.MustCompile(`^(disk\d+)(s\d+)*$`)
+
+// diskutilDrive is the physical drive under a Mac volume, from `diskutil info`:
+// its APFS physical store ("disk0s2" → "disk0"), or for other file systems the
+// whole disk it's part of.
+func diskutilDrive(out string) string {
+	for _, field := range []string{"APFS Physical Store", "Part of Whole"} {
+		if m := physicalStore.FindStringSubmatch(diskutilField(out, field)); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}

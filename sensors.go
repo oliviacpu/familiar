@@ -56,9 +56,15 @@ func buildSensors(r Reading, act *activity, cfg Config) []Sensor {
 		pct("memory", "Memory", "mdi:memory", r.Memory),
 		pct("disk", "Disk", "mdi:harddisk", r.Disk),
 	}
+	if a := driveAttributes(r.Health, r.DiskDrive); a != nil {
+		out[2].Attributes = a
+	}
 	for _, d := range r.Disks {
 		s := pct(d.ID, d.Name, "mdi:harddisk", d.Used)
 		s.Attributes = map[string]any{"path": d.Path, "size_gb": d.TotalGB, "free_gb": d.FreeGB}
+		for k, v := range driveAttributes(r.Health, d.Drive) {
+			s.Attributes[k] = v
+		}
 		out = append(out, s)
 	}
 	if len(r.Health) > 0 {

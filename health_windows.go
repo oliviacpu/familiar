@@ -188,3 +188,22 @@ func descString(b []byte, off uint32) string {
 }
 
 func collectDriveHealth(ctx context.Context) []DriveHealth { return readDriveHealth(ctx) }
+
+const ioctlStorageGetDeviceNumber = 0x002D1080
+
+// volumeDrive is the physical drive behind a drive letter, "Disk N" as in
+// Disk Management, from IOCTL_STORAGE_GET_DEVICE_NUMBER. A volume spanning
+// several drives (Storage Spaces, a dynamic disk) has no single one: "".
+func volumeDrive(mount string) string {
+	path, _ := windows.UTF16PtrFromString(`\\.\` + strings.TrimRight(mount, `\/`))
+	h, err := windows.CreateFile(path, 0, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		return ""
+	}
+	defer windows.CloseHandle(h)
+	out, err := ioctl(h, ioctlStorageGetDeviceNumber, make([]byte, 1), 12)
+	if err != nil || len(out) < 8 {
+		return ""
+	}
+	return fmt.Sprintf("Disk %d", binary.LittleEndian.Uint32(out[4:8]))
+}

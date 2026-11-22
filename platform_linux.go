@@ -224,3 +224,6 @@ func uninstall() error {
 func systemdQuote(s string) string {
 	return strconv.Quote(strings.NewReplacer("%", "%%", "$", "$$").Replace(s))
 }
+
+// volumeDrive: Linux drive health isn't read, so volumes aren't matched to drives.
+func volumeDrive(string) string { return "" }

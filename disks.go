@@ -19,6 +19,7 @@ type DiskUse struct {
 	ID, Name, Label, Path string
 	Used                  float64 // %
 	TotalGB, FreeGB       float64
+	Drive                 string // the physical drive it's on, as DriveHealth.Device names it; "" if unknown
 }
 
 // volume is a drive to measure: where it's mounted and what to call it.

@@ -14,6 +14,8 @@ Each computer gets the sensors it can measure:
 | `CPU temperature`, `GPU temperature` | °C |
 | `Disk` | % used on the main drive |
 | `Disk <name>` | % used on each other drive built into the machine: `Disk D:` on Windows, the volume's name on a Mac, the mount folder on Linux. Attributes: `path`, `size_gb`, `free_gb` |
+
+On Windows and macOS each `Disk` sensor also carries the health of the physical drive it's on: `drive` (`Disk 3`, `disk0`), `problem` (true when that drive reports trouble) and `health` (what it says), so a failing drive shows on every volume it holds.
 | `Drive problem` | on when any drive reports trouble (see below) |
 | `Network down`, `Network up` | Mbit/s |
 | `Last boot`, `Battery`, `Charging` | |

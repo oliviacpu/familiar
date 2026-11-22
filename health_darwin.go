@@ -119,3 +119,14 @@ func collectDriveHealth(ctx context.Context) []DriveHealth {
 	}
 	return ds
 }
+
+// volumeDrive is the physical drive under a mounted volume ("disk0").
+func volumeDrive(mount string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := runQuiet(ctx, "/usr/sbin/diskutil", "info", mount)
+	if err != nil {
+		return ""
+	}
+	return diskutilDrive(out)
+}

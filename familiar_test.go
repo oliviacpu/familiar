@@ -620,3 +620,29 @@ func TestDriveHealthParsing(t *testing.T) {
 		t.Errorf("healthy menu shows drives: %q", m.Drives)
 	}
 }
+
+func TestVolumeDriveHealth(t *testing.T) {
+	info := "   Volume Name:               Macintosh HD - Data\n   Part of Whole:             disk3\n   APFS Physical Store:       disk0s2\n"
+	if d := diskutilDrive(info); d != "disk0" {
+		t.Errorf("APFS volume's drive: %q", d)
+	}
+	if d := diskutilDrive("   Part of Whole:             disk4\n"); d != "disk4" {
+		t.Errorf("plain volume's drive: %q", d)
+	}
+	ds := []DriveHealth{{Device: "Disk 2", Status: "1 pending sector", Problem: true}, {Device: "Disk 3", Status: "Healthy"}}
+	r := Reading{Disk: 69, DiskDrive: "Disk 3", Health: ds,
+		Disks: []DiskUse{{ID: "disk_d", Name: "Disk D:", Path: "D:", Used: 59, Drive: "Disk 2"}, {ID: "disk_e", Name: "Disk E:", Path: "E:", Used: 90}}}
+	got := map[string]Sensor{}
+	for _, s := range buildSensors(r, nil, withDefaults(Config{})) {
+		got[s.UniqueID] = s
+	}
+	if a := got["disk"].Attributes; a["problem"] != false || a["drive"] != "Disk 3" {
+		t.Errorf("main disk: %v", a)
+	}
+	if a := got["disk_d"].Attributes; a["problem"] != true || a["health"] != "1 pending sector" || a["path"] != "D:" {
+		t.Errorf("D: on the failing drive: %v", a)
+	}
+	if _, ok := got["disk_e"].Attributes["problem"]; ok {
+		t.Errorf("E: has no known drive but got a problem attribute: %v", got["disk_e"].Attributes)
+	}
+}
