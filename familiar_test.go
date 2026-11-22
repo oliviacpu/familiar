@@ -291,20 +291,38 @@ func TestClientRegistersAndRecovers(t *testing.T) {
 	}
 }
 
+func TestErrorsLeaveOutTheWebhook(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close() // nothing listening, so the request fails with its URL in the error
+	_, err := newClient(srv.URL, "secret-hook").post(context.Background(), map[string]any{})
+	if err == nil || strings.Contains(err.Error(), "secret-hook") {
+		t.Fatalf("err = %v", err)
+	}
+	t.Log(err)
+}
+
 func TestBuildMenu(t *testing.T) {
 	charging := true
 	r := Reading{CPU: 12.4, Memory: 61.2, Disk: 72, CPUTemp: f(54), GPU: f(8), GPUTemp: f(48), NetDown: f(1.234), NetUp: f(12.6), Battery: f(96), Charging: &charging}
 	sent := time.Date(2026, 11, 6, 14, 2, 0, 0, time.Local)
 	m := buildMenu("laptop", r, activity{Busy: true}, sent, nil, "F")
-	want := menuText{Name: "laptop", Activity: "Busy", CPU: "CPU 12%, 129 °F", Memory: "Memory 61%", Disk: "Disk 72%",
-		GPU: "GPU 8%, 118 °F", Network: "Network ↓ 1.2 ↑ 13 Mbit/s", Battery: "Battery 96%, charging", Status: "Sent to Home Assistant at 2:02 PM"}
+	want := menuText{Title: "laptop – reported at 2:02 PM", Activity: "Busy", CPU: "CPU 12%, 129 °F", Memory: "Memory 61%", Disk: "Disk 72%",
+		GPU: "GPU 8%, 118 °F", Network: "Network ↓ 1.2 ↑ 13 Mbit/s", Battery: "Battery 96%, charging"}
 	if m != want {
 		t.Errorf("menu:\n got %+v\nwant %+v", m, want)
 	}
 	// A desktop with no GPU tool, before the first network rate, failing to send.
-	m = buildMenu("desktop", Reading{CPU: 3, Memory: 40, Disk: 50}, activity{}, time.Time{}, errors.New("dial tcp: connection refused"), "C")
-	if m.GPU != "" || m.Network != "" || m.Battery != "" || m.Activity != "Idle" || m.Status != "Not sent: dial tcp: connection refused" {
+	refused := errors.New("dial tcp: connection refused")
+	m = buildMenu("desktop", Reading{CPU: 3, Memory: 40, Disk: 50}, activity{}, time.Time{}, refused, "C")
+	if m.GPU != "" || m.Network != "" || m.Battery != "" || m.Activity != "Idle" ||
+		m.Title != "desktop – not reported yet" || m.Problem != "Not sent: dial tcp: connection refused" {
 		t.Errorf("sparse menu: %+v", m)
+	}
+	if m = buildMenu("desktop", Reading{}, activity{}, sent, refused, "C"); m.Title != "desktop – last reported at 2:02 PM" {
+		t.Errorf("failing after a report: %q", m.Title)
+	}
+	if m = buildMenu("desktop", Reading{}, activity{}, time.Time{}, nil, "C"); m.Title != "desktop – starting…" || m.Problem != "" {
+		t.Errorf("starting: %+v", m)
 	}
 }
 

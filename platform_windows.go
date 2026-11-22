@@ -4,15 +4,18 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -76,7 +79,42 @@ func readGPU(ctx context.Context) (util, temp *float64) {
 
 func readBattery(context.Context) (*float64, *bool) { return nil, nil }
 
+// What clicking a reading in the tray menu opens. Without one, it's disabled.
+var (
+	openCPU                          = launcher("taskmgr.exe")
+	openMemory, openGPU, openNetwork = openCPU, openCPU, openCPU
+	openStorage                      = launcher("explorer.exe", "ms-settings:storagesense")
+	openBattery                      opener // no battery reading on Windows, so the line never shows
+)
+
 func hideDockIcon() {} // nothing to hide: the Windows build has no window or taskbar button
+
+//go:embed icons/tray.ico
+var iconTray []byte
+
+func trayHost() bool { return true }
+
+// prepareTray holds the tray icon back until Explorer's taskbar exists, for
+// up to two minutes. The sign-in task can start before it, and then Windows
+// refuses the icon ("unable to init instance: Unspecified error") and systray
+// doesn't try again.
+func prepareTray(ctx context.Context) {
+	findWindow := windows.NewLazySystemDLL("user32.dll").NewProc("FindWindowW")
+	class, _ := windows.UTF16PtrFromString("Shell_TrayWnd")
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	for {
+		if h, _, _ := findWindow.Call(uintptr(unsafe.Pointer(class)), 0); h != 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			log.Print("no taskbar after two minutes; adding the icon anyway")
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
 
 // tempUnit follows the region's measurement system (US means °F).
 func tempUnit() string {
@@ -118,6 +156,9 @@ func setupLogging() {
 		return
 	}
 	log.SetOutput(io.MultiWriter(f, os.Stderr))
+	// A GUI program has no stderr, so a Go runtime crash (out of memory, say)
+	// would otherwise leave nothing behind.
+	_ = debug.SetCrashOutput(f, debug.CrashOptions{})
 }
 
 // isLocalDrive is true for drives built into this PC: fixed, and not on a

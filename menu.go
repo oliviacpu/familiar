@@ -8,13 +8,13 @@ import (
 
 // menuText is what the menu bar or tray menu shows. An empty line is hidden.
 type menuText struct {
-	Name, Activity, CPU, Memory, Disk, Drives, GPU, Network, Battery, Status string
+	Title, Problem, Activity, CPU, Memory, Disk, Drives, GPU, Network, Battery string
 }
 
 // buildMenu describes the last reading for the menu. unit is "F" or "C".
 func buildMenu(name string, r Reading, act activity, sentAt time.Time, sendErr error, unit string) menuText {
 	m := menuText{
-		Name:     name,
+		Title:    name + " – " + reported(sentAt, sendErr),
 		Activity: "Idle",
 		CPU:      fmt.Sprintf("CPU %.0f%%", r.CPU) + tempSuffix(r.CPUTemp, unit),
 		Memory:   fmt.Sprintf("Memory %.0f%%", r.Memory),
@@ -43,15 +43,24 @@ func buildMenu(name string, r Reading, act activity, sentAt time.Time, sendErr e
 			m.Battery += ", charging"
 		}
 	}
-	switch {
-	case sendErr != nil:
-		m.Status = "Not sent: " + shorten(sendErr.Error(), 60)
-	case !sentAt.IsZero():
-		m.Status = "Sent to Home Assistant at " + sentAt.Format("3:04 PM")
-	default:
-		m.Status = "Starting…"
+	if sendErr != nil {
+		m.Problem = "Not sent: " + shorten(sendErr.Error(), 60)
 	}
 	return m
+}
+
+// reported says when Home Assistant last got a reading, for the title.
+func reported(sentAt time.Time, sendErr error) string {
+	switch {
+	case sentAt.IsZero() && sendErr == nil:
+		return "starting…"
+	case sentAt.IsZero():
+		return "not reported yet"
+	case sendErr != nil:
+		return "last reported at " + sentAt.Format("3:04 PM")
+	default:
+		return "reported at " + sentAt.Format("3:04 PM")
+	}
 }
 
 func tempSuffix(c *float64, unit string) string {

@@ -62,6 +62,16 @@ func readBattery(ctx context.Context) (*float64, *bool) {
 	return parsePmset(out)
 }
 
+// What clicking a reading in the menu opens.
+var (
+	openCPU     = activityMonitor(tabCPU)
+	openMemory  = activityMonitor(tabMemory)
+	openGPU     = openCPU // the CPU tab has the % GPU and GPU Time columns
+	openNetwork = activityMonitor(tabNetwork)
+	openStorage = launcher("/usr/bin/open", "x-apple.systempreferences:com.apple.settings.Storage")
+	openBattery = launcher("/usr/bin/open", "x-apple.systempreferences:com.apple.Battery-Settings.extension") // Battery Health is here
+)
+
 const launchLabel = "zone.olivia.familiar"
 
 func plistPath() string {

@@ -4,19 +4,24 @@ package main
 
 import (
 	"context"
+	_ "embed"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"fyne.io/systray"
+	"github.com/godbus/dbus/v5"
 )
 
 func attachConsole() {}
 
-func setupLogging() {} // the container's log
+func setupLogging() {} // the container's log, or the journal on a desktop
 
 func runQuiet(ctx context.Context, name string, args ...string) (string, error) {
 	out, err := exec.CommandContext(ctx, name, args...).Output()
@@ -37,84 +42,70 @@ func readGPU(ctx context.Context) (util, temp *float64) {
 
 func readBattery(context.Context) (*float64, *bool) { return nil, nil }
 
-// runReporter shows a panel icon on a Linux desktop (a session bus and a
-// display), and otherwise reports headless, as in a container.
-func runReporter(ctx context.Context, a *agent) error {
-	if os.Getenv("DBUS_SESSION_BUS_ADDRESS") != "" && (os.Getenv("WAYLAND_DISPLAY") != "" || os.Getenv("DISPLAY") != "") {
-		return runTray(ctx, a)
+//go:embed icons/tray.png
+var iconTray []byte // panels don't tint icons, so it's violet like the Windows one
+
+// trayHost says whether there's a desktop session to show the icon in. Panels
+// find tray icons over the D-Bus session bus, which the container doesn't have.
+func trayHost() bool {
+	if _, err := dbus.SessionBus(); err != nil { // systray reuses this connection
+		log.Printf("no desktop session, so no icon (%v)", err)
+		return false
 	}
-	return loop(ctx, a, nil)
+	return true
 }
+
+// prepareTray names the icon before systray publishes it. Panels keep each
+// icon's settings (shown or hidden) under its name, and the default one has the
+// process ID in it. The panel itself can start after familiar: systray
+// registers with it whenever it appears.
+func prepareTray(context.Context) { systray.SetTitle("Familiar") }
 
 func hideDockIcon() {}
 
-func tempUnit() string { return "C" }
+// What clicking a reading opens: the desktop's system monitor, on the matching
+// tab in GNOME's. There's no GPU or battery view to open, so those stay labels.
+var (
+	openCPU              = systemMonitor("--show-processes-tab")
+	openMemory           = systemMonitor("--show-resources-tab")
+	openNetwork          = openMemory
+	openStorage          = systemMonitor("--show-file-systems-tab")
+	openGPU, openBattery opener
+)
+
+// systemMonitor opens GNOME's System Monitor on a tab (switching an open one
+// too, since it forwards the option to its window), or another desktop's
+// monitor as it opens. nil when there isn't one.
+func systemMonitor(gnomeTab string) opener {
+	if p, err := exec.LookPath("gnome-system-monitor"); err == nil {
+		return launcher(p, gnomeTab)
+	}
+	for _, name := range []string{"plasma-systemmonitor", "mate-system-monitor", "xfce4-taskmanager"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return launcher(p)
+		}
+	}
+	return nil
+}
+
+// tempUnit goes by the locale's name, the way it sets measurement: US means °F.
+func tempUnit() string {
+	for _, v := range []string{"LC_ALL", "LC_MEASUREMENT", "LANG"} {
+		if l := os.Getenv(v); l != "" {
+			if strings.Contains(l, "_US") {
+				return "F"
+			}
+			return "C"
+		}
+	}
+	return "C"
+}
 
 func printPlatformTemps() {}
 
 func readCPUTemp(context.Context) *float64 { return nil } // hwmon covers it
 
-// On a Linux desktop, familiar starts at sign-in from an XDG autostart entry,
-// the standard place for a panel icon. In a container it's the container's
-// command instead (see README.md).
-func autostartPath() string {
-	dir := os.Getenv("XDG_CONFIG_HOME")
-	if dir == "" {
-		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".config")
-	}
-	return filepath.Join(dir, "autostart", "familiar.desktop")
-}
-
-func install() error {
-	exe, err := selfPath()
-	if err != nil {
-		return err
-	}
-	entry := "[Desktop Entry]\nType=Application\nName=Familiar\nComment=Reports this computer's load to Home Assistant\n" +
-		"Exec=\"" + exe + "\" run\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
-	if err := os.MkdirAll(filepath.Dir(autostartPath()), 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(autostartPath(), []byte(entry), 0o644); err != nil {
-		return err
-	}
-	stopOthers()
-	cmd := exec.Command(exe, "run")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	fmt.Println("Familiar now starts when you sign in, and is running. Entry:", autostartPath())
-	return nil
-}
-
-func uninstall() error {
-	if err := os.Remove(autostartPath()); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	stopOthers()
-	fmt.Println("Familiar no longer starts when you sign in, and has stopped.")
-	return nil
-}
-
-// stopOthers ends other familiar processes run from this binary.
-func stopOthers() {
-	exe, err := selfPath()
-	if err != nil {
-		return
-	}
-	entries, _ := os.ReadDir("/proc")
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == os.Getpid() {
-			continue
-		}
-		if p, err := os.Readlink(filepath.Join("/proc", e.Name(), "exe")); err == nil && p == exe {
-			syscall.Kill(pid, syscall.SIGTERM)
-		}
-	}
-}
+const unitName = "familiar.service"
 
 // isLocalDrive leaves out removable and USB drives; wanted() already left out
 // network mounts. mount is found again in /proc/self/mounts for its device.
@@ -165,4 +156,71 @@ func removableBlock(dev string) bool {
 		}
 	}
 	return false
+}
+
+func unitPath() string {
+	dir, err := os.UserConfigDir() // ~/.config, where systemd looks for user units
+	if err != nil {
+		dir = "."
+	}
+	return filepath.Join(dir, "systemd", "user", unitName)
+}
+
+// install adds a systemd user service that starts familiar with the desktop
+// session and restarts it if it crashes. A clean exit (Quit, or the
+// registration was deleted) isn't restarted.
+func install() error {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return errors.New("familiar install needs systemd; in a container, run familiar as the container's command (see README.md)")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
+		return err
+	}
+	unit := fmt.Sprintf(`[Unit]
+Description=Familiar, reporting this computer's load to Home Assistant
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%s run
+Restart=on-failure
+RestartSec=10
+# Stopping familiar leaves what its menu opened (System Monitor) open.
+KillMode=process
+
+[Install]
+WantedBy=graphical-session.target
+`, systemdQuote(exe))
+	if err := os.MkdirAll(filepath.Dir(unitPath()), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(unitPath(), []byte(unit), 0o644); err != nil {
+		return err
+	}
+	for _, args := range [][]string{{"daemon-reload"}, {"enable", unitName}, {"restart", unitName}} {
+		if out, err := exec.Command("systemctl", append([]string{"--user"}, args...)...).CombinedOutput(); err != nil {
+			return fmt.Errorf("systemctl --user %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+	}
+	fmt.Println("Familiar now starts with your desktop session, and is running. Log: journalctl --user -u familiar")
+	return nil
+}
+
+func uninstall() error {
+	_ = exec.Command("systemctl", "--user", "disable", "--now", unitName).Run()
+	if err := os.Remove(unitPath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+	fmt.Println("Familiar no longer starts with your desktop session, and has stopped.")
+	return nil
+}
+
+// systemdQuote quotes a path for ExecStart, where % and $ are special.
+func systemdQuote(s string) string {
+	return strconv.Quote(strings.NewReplacer("%", "%%", "$", "$$").Replace(s))
 }

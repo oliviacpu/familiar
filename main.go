@@ -72,7 +72,7 @@ func usage() {
   familiar drives      Print each drive's health (temperature, wear, errors).
   familiar temps       List every temperature sensor, and which ones count as CPU and GPU.
   familiar run         Keep reporting (what the login item runs).
-  familiar install     Start familiar at login (macOS and Windows).
+  familiar install     Start familiar at login (macOS, Windows and Linux desktops).
   familiar uninstall   Stop starting it at login.
   familiar version
 `)
@@ -225,7 +225,7 @@ func cmdRun() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return runReporter(ctx, newAgent(cfg)) // with a menu bar or tray icon, or headless on Linux
+	return runReporter(ctx, newAgent(cfg)) // with a menu bar or tray icon, or headless without a desktop
 }
 
 // loop reports until ctx ends or Home Assistant deletes the registration.

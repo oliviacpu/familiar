@@ -56,11 +56,15 @@ familiar install
 
 - **macOS:** a LaunchAgent (`~/Library/LaunchAgents/zone.olivia.familiar.plist`), logging to `~/Library/Logs/familiar.log`, with an icon in the menu bar.
 - **Windows:** one administrator prompt, then it installs [PawnIO](https://pawnio.eu) if it's missing (for the CPU temperature) and creates the scheduled task **Familiar**, which starts it at sign-in with administrator rights and no prompt. It logs to `%LocalAppData%\familiar\familiar.log`. Icon in the notification area.
-- **Linux desktop:** an autostart entry (`~/.config/autostart/familiar.desktop`) and an icon in the panel (StatusNotifierItem; GNOME needs the AppIndicator extension).
+- **Linux desktop:** a systemd user service (`~/.config/systemd/user/familiar.service`) that starts and stops with the desktop session and restarts familiar if it crashes, logging to the journal (`journalctl --user -u familiar`). The icon goes in the panel (StatusNotifierItem; GNOME needs the AppIndicator extension).
 
-`familiar uninstall` removes it again. `familiar once` prints a reading without sending it, `familiar drives` prints each drive's health, and `familiar temps` lists the temperature sensors it found.
+`familiar uninstall` removes the login item, task or service again. `familiar once` prints a reading without sending it, `familiar drives` prints each drive's health, and `familiar temps` lists the temperature sensors it found.
 
 Settings are in `config.json` in the user's config folder (`~/Library/Application Support/familiar`, `%AppData%\familiar`, `~/.config/familiar`). Every setting can also come from a `FAMILIAR_*` variable; see `config.go`.
+
+## The menu
+
+The icon's menu is titled with the computer's name and when it last reported, with any sending problem under it. The readings that have somewhere to look closer open it when clicked: CPU and activity open Activity Monitor (on its CPU tab), Task Manager or the system monitor; memory, storage, GPU, network and battery open their own tab or settings page. The rest are labels.
 
 ## Updates
 
@@ -109,6 +113,10 @@ Without PawnIO or administrator rights it reports everything else.
 
 - `pawnio/IntelMSR.bin` and `pawnio/AMDFamily17.bin`: from [PawnIO.Modules 0.2.11](https://github.com/namazso/PawnIO.Modules/releases/tag/0.2.11), LGPL-2.1 (`pawnio/COPYING`).
 - `PawnIO_setup.exe`: [PawnIO.Setup 2.2.0](https://github.com/namazso/PawnIO.Setup/releases/tag/2.2.0), signed by namazso. It isn't kept in git; the workflow downloads it and checks its SHA-256 (in `.github/workflows/release.yml`). For a local Windows build, put it in `pawnio/` the same way.
+
+## Icon
+
+The cat is [Fluent UI System Icons](https://github.com/microsoft/fluentui-system-icons)' `animal_cat_28_filled` (MIT). `icons/render.py` renders `icons/familiar.svg` to the macOS menu bar template, the Windows `.ico` and the Linux PNG.
 
 ## Building
 

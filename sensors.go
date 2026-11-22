@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -112,7 +113,9 @@ type agent struct {
 	busy      busyTracker
 	types     map[string]string // sensors sent before, so a missing one can be cleared
 
-	// The last reading and how sending it went, for the menu.
+	// The last reading and how sending it went, for the menu. mu guards them:
+	// the menu first reads them while the loop is already reporting.
+	mu      sync.Mutex
 	last    Reading
 	lastAct activity
 	sentAt  time.Time
@@ -153,15 +156,20 @@ func (a *agent) tick(ctx context.Context, prime time.Duration) (int, error) {
 		}
 	}
 	err := a.client.send(ctx, out)
+	a.mu.Lock()
 	a.last, a.lastAct, a.lastErr = r, act, err
 	if err == nil {
 		a.sentAt = time.Now()
 	}
+	a.mu.Unlock()
 	return len(out), err
 }
 
 func (a *agent) menu() menuText {
-	return buildMenu(a.cfg.Name, a.last, a.lastAct, a.sentAt, a.lastErr, tempUnit())
+	unit := tempUnit()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return buildMenu(a.cfg.Name, a.last, a.lastAct, a.sentAt, a.lastErr, unit)
 }
 
 func median(xs []float64) float64 {

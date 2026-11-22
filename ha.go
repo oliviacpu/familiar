@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -63,6 +64,12 @@ func (c *client) post(ctx context.Context, payload any) ([]byte, error) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
+		// The error repeats the URL, and the webhook ID in it is a secret: keep
+		// it out of the log and the menu.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			ue.URL = c.url + "/api/webhook/…"
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()

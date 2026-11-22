@@ -24,6 +24,12 @@ import (
 
 func hideDockIcon() { C.familiarHideDockIcon() }
 
+func trayHost() bool { return true }
+
+func prepareTray(context.Context) {} // the menu bar is there before any login item starts
+
+var iconTray []byte // unused: the menu bar takes the template image
+
 var unitOnce sync.Once
 var unit = "C"
 
