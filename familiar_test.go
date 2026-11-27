@@ -268,7 +268,7 @@ func TestClientRegistersAndRecovers(t *testing.T) {
 	ha := &fakeHA{registered: map[string]bool{}}
 	srv := httptest.NewServer(ha)
 	defer srv.Close()
-	c := newClient(srv.URL, "hook")
+	c := newMobileApp(srv.URL, "hook")
 	ctx := context.Background()
 	readings := buildSensors(Reading{CPU: 10, Memory: 20, Disk: 30}, nil, withDefaults(Config{}))
 
@@ -294,7 +294,7 @@ func TestClientRegistersAndRecovers(t *testing.T) {
 func TestErrorsLeaveOutTheWebhook(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	srv.Close() // nothing listening, so the request fails with its URL in the error
-	_, err := newClient(srv.URL, "secret-hook").post(context.Background(), map[string]any{})
+	_, err := newMobileApp(srv.URL, "secret-hook").post(context.Background(), map[string]any{})
 	if err == nil || strings.Contains(err.Error(), "secret-hook") {
 		t.Fatalf("err = %v", err)
 	}

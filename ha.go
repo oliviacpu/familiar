@@ -45,17 +45,23 @@ type update struct {
 	Attributes map[string]any `json:"attributes,omitempty"`
 }
 
-type client struct {
+// mobileApp is the transport that sends readings to this computer's mobile_app
+// webhook, registering each sensor the first time it's sent.
+type mobileApp struct {
 	url, webhook string
 	http         *http.Client
 	registered   map[string]bool
 }
 
-func newClient(url, webhook string) *client {
-	return &client{url: url, webhook: webhook, http: &http.Client{Timeout: 20 * time.Second}, registered: map[string]bool{}}
+func newMobileApp(url, webhook string) *mobileApp {
+	return &mobileApp{url: url, webhook: webhook, http: &http.Client{Timeout: 20 * time.Second}, registered: map[string]bool{}}
 }
 
-func (c *client) post(ctx context.Context, payload any) ([]byte, error) {
+func (c *mobileApp) knows(id string) bool { return c.registered[id] }
+
+func (c *mobileApp) close() {} // each request stands alone
+
+func (c *mobileApp) post(ctx context.Context, payload any) ([]byte, error) {
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url+"/api/webhook/"+c.webhook, bytes.NewReader(body))
 	if err != nil {
@@ -83,7 +89,7 @@ func (c *client) post(ctx context.Context, payload any) ([]byte, error) {
 	return data, nil
 }
 
-func (c *client) register(ctx context.Context, s Sensor) error {
+func (c *mobileApp) register(ctx context.Context, s Sensor) error {
 	data, err := c.post(ctx, map[string]any{"type": "register_sensor", "data": s})
 	if err != nil {
 		return err
@@ -100,7 +106,7 @@ func (c *client) register(ctx context.Context, s Sensor) error {
 
 // send registers sensors it hasn't registered yet, then updates them all.
 // Sensors Home Assistant says it doesn't know are registered again next time.
-func (c *client) send(ctx context.Context, sensors []Sensor) error {
+func (c *mobileApp) send(ctx context.Context, sensors []Sensor) error {
 	for _, s := range sensors {
 		if !c.registered[s.UniqueID] {
 			if err := c.register(ctx, s); err != nil {
@@ -148,22 +154,7 @@ func (c *client) send(ctx context.Context, sensors []Sensor) error {
 // registerDevice adds this computer to Home Assistant as a mobile_app device and
 // returns its webhook ID. This is the only call that needs the access token.
 func registerDevice(ctx context.Context, url, token, name string) (string, error) {
-	info, _ := host.InfoWithContext(ctx)
-	osName, osVersion, manufacturer := runtime.GOOS, "", ""
-	if info != nil {
-		osVersion = info.PlatformVersion
-	}
-	switch runtime.GOOS {
-	case "darwin":
-		osName, manufacturer = "macOS", "Apple"
-	case "windows":
-		osName, manufacturer = "Windows", "Microsoft"
-	case "linux":
-		osName, manufacturer = "Linux", "Linux"
-		if info != nil && info.Platform != "" {
-			osName = info.Platform
-		}
-	}
+	osName, osVersion, manufacturer := osInfo(ctx)
 	id := make([]byte, 8)
 	_, _ = rand.Read(id)
 	hostname, _ := os.Hostname()
@@ -206,4 +197,26 @@ func registerDevice(ctx context.Context, url, token, name string) (string, error
 		return "", fmt.Errorf("registering gave no webhook ID: %s", strings.TrimSpace(string(data)))
 	}
 	return res.WebhookID, nil
+}
+
+// osInfo names this computer's OS, its version and who makes it, for the
+// device page in Home Assistant.
+func osInfo(ctx context.Context) (osName, osVersion, manufacturer string) {
+	info, _ := host.InfoWithContext(ctx)
+	osName = runtime.GOOS
+	if info != nil {
+		osVersion = info.PlatformVersion
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		osName, manufacturer = "macOS", "Apple"
+	case "windows":
+		osName, manufacturer = "Windows", "Microsoft"
+	case "linux":
+		osName, manufacturer = "Linux", "Linux"
+		if info != nil && info.Platform != "" {
+			osName = info.Platform
+		}
+	}
+	return osName, osVersion, manufacturer
 }

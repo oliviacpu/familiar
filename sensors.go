@@ -111,10 +111,23 @@ func buildSensors(r Reading, act *activity, cfg Config) []Sensor {
 	return out
 }
 
+// transport carries readings to Home Assistant: the mobile_app webhook
+// (mobileApp, ha.go).
+type transport interface {
+	// send delivers one reading. A sensor with only its UniqueID and Type and
+	// a nil State has gone away, and shows as unknown.
+	send(ctx context.Context, sensors []Sensor) error
+	// knows is whether Home Assistant has been told about a sensor, so one
+	// that goes away can be cleared.
+	knows(id string) bool
+	// close says goodbye, where there's a connection to end.
+	close()
+}
+
 type agent struct {
 	cfg       Config
 	collector *collector
-	client    *client
+	transport transport
 	updates   *updater // nil when auto-update is off
 	busy      busyTracker
 	types     map[string]string // sensors sent before, so a missing one can be cleared
@@ -129,7 +142,7 @@ type agent struct {
 }
 
 func newAgent(cfg Config) *agent {
-	a := &agent{cfg: cfg, collector: newCollector(cfg), client: newClient(cfg.URL, cfg.WebhookID), types: map[string]string{}}
+	a := &agent{cfg: cfg, collector: newCollector(cfg), transport: newMobileApp(cfg.URL, cfg.WebhookID), types: map[string]string{}}
 	if cfg.autoUpdate() {
 		a.updates = newUpdater()
 	}
@@ -147,7 +160,11 @@ func (a *agent) tick(ctx context.Context, prime time.Duration) (int, error) {
 			return 0, ctx.Err()
 		}
 	}
-	r := a.collector.Read(ctx)
+	return a.report(ctx, a.collector.Read(ctx))
+}
+
+// report sends a reading, and keeps it and how sending went for the menu.
+func (a *agent) report(ctx context.Context, r Reading) (int, error) {
 	act := a.busy.add(r.CPU, r.GPU, a.cfg)
 	out := buildSensors(r, &act, a.cfg)
 	present := map[string]bool{}
@@ -157,11 +174,11 @@ func (a *agent) tick(ctx context.Context, prime time.Duration) (int, error) {
 	}
 	// A reading that has gone away (say the GPU tool stopped answering) shows as unknown.
 	for id, typ := range a.types {
-		if !present[id] && a.client.registered[id] {
+		if !present[id] && a.transport.knows(id) {
 			out = append(out, Sensor{UniqueID: id, Type: typ, State: nil})
 		}
 	}
-	err := a.client.send(ctx, out)
+	err := a.transport.send(ctx, out)
 	a.mu.Lock()
 	a.last, a.lastAct, a.lastErr = r, act, err
 	if err == nil {
