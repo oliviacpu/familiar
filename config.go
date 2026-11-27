@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -16,9 +19,21 @@ import (
 // directory, and every field can also come from a FAMILIAR_* variable, which
 // is how a container is set up.
 type Config struct {
-	URL       string `json:"url"`
-	WebhookID string `json:"webhook_id"`
+	URL       string `json:"url,omitempty"`
+	WebhookID string `json:"webhook_id,omitempty"`
 	Name      string `json:"name,omitempty"` // shown at the top of the menu
+
+	// MQTT, used instead of the webhook when MQTTURL is set (mqtt.go).
+	MQTTURL      string `json:"mqtt_url,omitempty"`  // tcp://host:1883
+	MQTTUser     string `json:"mqtt_user,omitempty"` // the device ID unless set
+	MQTTPassword secret `json:"mqtt_password,omitempty"`
+	// MQTTPasswordFile is read for the password at start, e.g. a container's secret file.
+	MQTTPasswordFile string `json:"mqtt_password_file,omitempty"`
+	// DeviceID names this computer in its MQTT topics. A slug of Name unless set.
+	DeviceID string `json:"device_id,omitempty"`
+	// EntityPrefix starts each entity ID (sensor.<prefix>_cpu). A slug of Name
+	// unless set; set it to keep the entity IDs a computer already has.
+	EntityPrefix string `json:"entity_prefix,omitempty"`
 
 	IntervalSeconds int     `json:"interval_seconds,omitempty"`
 	BusyCPU         float64 `json:"busy_cpu_percent,omitempty"`
@@ -32,6 +47,17 @@ type Config struct {
 }
 
 func (c Config) autoUpdate() bool { return c.AutoUpdate == nil || *c.AutoUpdate }
+
+// secret is a password. Printing it (or a Config holding it, with %v or %+v)
+// shows a placeholder; JSON still saves it.
+type secret string
+
+func (s secret) String() string {
+	if s == "" {
+		return ""
+	}
+	return "…"
+}
 
 const (
 	defaultInterval    = 30
@@ -62,7 +88,22 @@ func loadConfig() (Config, error) {
 		return cfg, err
 	}
 	applyEnv(&cfg, os.Getenv)
-	return cfg, nil
+	return cfg, readPasswordFile(&cfg)
+}
+
+// readPasswordFile takes the MQTT password from its file, when there is one.
+// A file wins over a password set elsewhere: it's the deliberate choice in a
+// container. Only its trailing line break is dropped.
+func readPasswordFile(cfg *Config) error {
+	if cfg.MQTTPasswordFile == "" {
+		return nil
+	}
+	data, err := os.ReadFile(cfg.MQTTPasswordFile)
+	if err != nil {
+		return fmt.Errorf("reading the MQTT password file: %w", err)
+	}
+	cfg.MQTTPassword = secret(strings.TrimRight(string(data), "\r\n"))
+	return nil
 }
 
 func applyEnv(cfg *Config, getenv func(string) string) {
@@ -74,6 +115,24 @@ func applyEnv(cfg *Config, getenv func(string) string) {
 	}
 	if v := getenv("FAMILIAR_NAME"); v != "" {
 		cfg.Name = v
+	}
+	if v := getenv("FAMILIAR_MQTT_URL"); v != "" {
+		cfg.MQTTURL = strings.TrimSpace(v)
+	}
+	if v := getenv("FAMILIAR_MQTT_USER"); v != "" {
+		cfg.MQTTUser = v
+	}
+	if v := getenv("FAMILIAR_MQTT_PASSWORD"); v != "" {
+		cfg.MQTTPassword = secret(v)
+	}
+	if v := getenv("FAMILIAR_MQTT_PASSWORD_FILE"); v != "" {
+		cfg.MQTTPasswordFile = v
+	}
+	if v := getenv("FAMILIAR_DEVICE_ID"); v != "" {
+		cfg.DeviceID = v
+	}
+	if v := getenv("FAMILIAR_ENTITY_PREFIX"); v != "" {
+		cfg.EntityPrefix = v
 	}
 	if v, err := strconv.Atoi(getenv("FAMILIAR_INTERVAL")); err == nil && v > 0 {
 		cfg.IntervalSeconds = v
@@ -123,7 +182,27 @@ func withDefaults(cfg Config) Config {
 	if cfg.Name == "" {
 		cfg.Name, _ = os.Hostname()
 	}
+	if cfg.DeviceID == "" {
+		cfg.DeviceID = nameSlug(cfg.Name)
+	}
+	if cfg.EntityPrefix = slug(cfg.EntityPrefix); cfg.EntityPrefix == "" {
+		cfg.EntityPrefix = nameSlug(cfg.Name)
+	}
+	if cfg.MQTTUser == "" {
+		cfg.MQTTUser = cfg.DeviceID // so a broker ACL can give each user the topics named after it
+	}
 	return cfg
+}
+
+// nameSlug is a computer's name as an ID: "Office PC" is office_pc. A name
+// with nothing slug keeps (another script, say) becomes a hash of itself.
+func nameSlug(name string) string {
+	if s := slug(name); s != "" {
+		return s
+	}
+	h := fnv.New32a()
+	h.Write([]byte(name))
+	return fmt.Sprintf("%08x", h.Sum32())
 }
 
 // defaultDisk is the volume people mean by "my disk". On macOS that's the data
@@ -140,10 +219,62 @@ func defaultDisk(goos string) string {
 }
 
 func (c Config) validate() error {
+	if c.MQTTURL != "" {
+		if err := checkMQTTURL(c.MQTTURL); err != nil {
+			return err
+		}
+		if !topicID.MatchString(c.DeviceID) {
+			return fmt.Errorf("device_id %q may only have letters, digits, _ and -", c.DeviceID)
+		}
+		return nil
+	}
 	if c.URL == "" || c.WebhookID == "" {
 		return fmt.Errorf("not set up yet: run familiar setup (settings file: %s)", configPath())
 	}
 	return nil
+}
+
+// topicID is what Home Assistant allows in a discovery topic's ID.
+var topicID = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// checkMQTTURL checks a broker address. Its errors leave the address out, in
+// case it holds a password.
+func checkMQTTURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return errors.New("mqtt_url should look like tcp://homeassistant.local:1883")
+	}
+	if u.User != nil {
+		return errors.New("put the MQTT user and password in mqtt_user and mqtt_password, not in mqtt_url")
+	}
+	switch u.Scheme {
+	case "tcp", "mqtt", "ssl", "tls", "mqtts":
+		if u.Port() == "" {
+			return errors.New("mqtt_url needs a port, e.g. tcp://homeassistant.local:1883 (8883 for ssl://)")
+		}
+	case "ws", "wss":
+	default:
+		return fmt.Errorf("mqtt_url: unknown scheme %q (tcp, ssl, ws or wss)", u.Scheme)
+	}
+	return nil
+}
+
+// userWarning is set when the MQTT user isn't the device ID. A broker whose
+// ACL gives each user the topics named after it (familiar/%u/#) then refuses
+// this computer's.
+func (c Config) userWarning() string {
+	if c.MQTTURL == "" || c.MQTTUser == c.DeviceID {
+		return ""
+	}
+	return fmt.Sprintf("the MQTT user %q isn't the device ID %q; a broker that only lets each user write its own topics (familiar/<user>/…) will refuse this computer's", c.MQTTUser, c.DeviceID)
+}
+
+// destination is where readings go, for the log.
+func (c Config) destination() string {
+	if c.MQTTURL != "" {
+		return c.MQTTURL
+	}
+	return c.URL
 }
 
 func (c Config) interval() time.Duration { return time.Duration(c.IntervalSeconds) * time.Second }
@@ -154,7 +285,10 @@ func saveConfig(cfg Config) error {
 		return err
 	}
 	data, _ := json.MarshalIndent(cfg, "", "  ")
-	return os.WriteFile(path, append(data, '\n'), 0o600)
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600) // WriteFile keeps an existing file's mode
 }
 
 func trimURL(u string) string { return strings.TrimRight(strings.TrimSpace(u), "/") }

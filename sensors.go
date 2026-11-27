@@ -112,7 +112,7 @@ func buildSensors(r Reading, act *activity, cfg Config) []Sensor {
 }
 
 // transport carries readings to Home Assistant: the mobile_app webhook
-// (mobileApp, ha.go).
+// (mobileApp, ha.go) or an MQTT broker with discovery (mqtt, mqtt.go).
 type transport interface {
 	// send delivers one reading. A sensor with only its UniqueID and Type and
 	// a nil State has gone away, and shows as unknown.
@@ -141,8 +141,17 @@ type agent struct {
 	lastErr error
 }
 
+// newAgent reports through MQTT when there's a broker set, and otherwise
+// through the mobile_app webhook.
 func newAgent(cfg Config) *agent {
-	a := &agent{cfg: cfg, collector: newCollector(cfg), transport: newMobileApp(cfg.URL, cfg.WebhookID), types: map[string]string{}}
+	a := &agent{cfg: cfg, collector: newCollector(cfg), types: map[string]string{}}
+	if cfg.MQTTURL != "" {
+		m := newMQTT(cfg)
+		m.connect()
+		a.transport = m
+	} else {
+		a.transport = newMobileApp(cfg.URL, cfg.WebhookID)
+	}
 	if cfg.autoUpdate() {
 		a.updates = newUpdater()
 	}

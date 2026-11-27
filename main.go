@@ -1,16 +1,21 @@
 // Command familiar reports a computer's load to Home Assistant.
 //
-// It registers itself the way the Home Assistant phone app does (the mobile_app
-// integration) and then sends its readings to that registration's webhook. The
-// machine needs Home Assistant's address and the webhook ID, nothing else.
+// It sends its readings one of two ways. Through an MQTT broker, where Home
+// Assistant finds the computer and its sensors by MQTT discovery; the machine
+// needs the broker's address and its own user and password (mqtt.go). Or the
+// way the Home Assistant phone app does (the mobile_app integration), to its
+// registration's webhook; the machine needs Home Assistant's address and the
+// webhook ID, nothing else (ha.go).
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -68,6 +73,9 @@ func usage() {
       Save the address and webhook, then send one reading to check it works.
   familiar setup --url http://homeassistant.local:8123 --token <token> --name <name>
       Register this computer in Home Assistant first. The token is used once and not saved.
+  familiar setup --mqtt-url tcp://homeassistant.local:1883 --name <name> --mqtt-password-stdin
+      Report through an MQTT broker instead, with the password from standard input.
+      --mqtt-user (default: the device ID, from the name) and --entity-prefix are optional.
   familiar once        Print one reading here. Sends nothing.
   familiar drives      Print each drive's health (temperature, wear, errors).
   familiar temps       List every temperature sensor, and which ones count as CPU and GPU.
@@ -84,8 +92,15 @@ func cmdSetup(args []string) error {
 	webhook := fs.String("webhook", "", "webhook ID of an existing registration")
 	token := fs.String("token", "", "long-lived access token, used once to register")
 	name := fs.String("name", "", "name for this computer (registers it under this name with --token)")
+	mqttURL := fs.String("mqtt-url", "", "MQTT broker, e.g. tcp://homeassistant.local:1883, instead of --url")
+	mqttUser := fs.String("mqtt-user", "", "MQTT user (default: the device ID, from --name)")
+	passwordStdin := fs.Bool("mqtt-password-stdin", false, "read the MQTT password from standard input")
+	prefix := fs.String("entity-prefix", "", "start of this computer's entity IDs, e.g. office_pc (default: from --name)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *mqttURL != "" {
+		return setupMQTT(*mqttURL, *mqttUser, *name, *prefix, *passwordStdin)
 	}
 	if *token == "" {
 		*token = os.Getenv("FAMILIAR_TOKEN")
@@ -120,6 +135,48 @@ func cmdSetup(args []string) error {
 		return fmt.Errorf("saved, but sending a reading failed: %w", err)
 	}
 	fmt.Printf("Sent %d readings to %s. Next: familiar install\n", n, cfg.URL)
+	return nil
+}
+
+// setupMQTT saves the broker and this computer's IDs, then sends one reading
+// to check them. The password never comes from a flag, which other users of
+// the computer can see: it's read from standard input, or FAMILIAR_MQTT_PASSWORD.
+func setupMQTT(broker, user, name, prefix string, passwordStdin bool) error {
+	if name == "" {
+		return errors.New("--name is required with --mqtt-url")
+	}
+	password := os.Getenv("FAMILIAR_MQTT_PASSWORD")
+	if passwordStdin {
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("reading the password: %w", err)
+		}
+		password = strings.TrimRight(line, "\r\n")
+	}
+	full := withDefaults(Config{MQTTURL: strings.TrimSpace(broker), MQTTUser: user, MQTTPassword: secret(password), Name: name, EntityPrefix: prefix})
+	if err := full.validate(); err != nil {
+		return err
+	}
+	// The IDs are saved, so renaming the computer later doesn't move its topics or entities.
+	cfg := Config{MQTTURL: full.MQTTURL, MQTTUser: full.MQTTUser, MQTTPassword: full.MQTTPassword, Name: name,
+		DeviceID: full.DeviceID, EntityPrefix: full.EntityPrefix}
+	if err := saveConfig(cfg); err != nil {
+		return err
+	}
+	fmt.Println("Saved settings to", configPath())
+	if w := full.userWarning(); w != "" {
+		fmt.Println("Warning:", w)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	a := newAgent(full)
+	defer a.transport.close()
+	n, err := a.tick(ctx, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("saved, but sending a reading failed: %w", err)
+	}
+	fmt.Printf("Sent %d readings to %s as %s (entities %s_…). Next: familiar install\n", n, full.MQTTURL, full.DeviceID, full.EntityPrefix)
 	return nil
 }
 
@@ -221,7 +278,10 @@ func cmdRun() error {
 	}
 	setupLogging()
 	cleanupOldSelf()
-	log.Printf("familiar %s reporting to %s every %s", version, cfg.URL, cfg.interval())
+	log.Printf("familiar %s reporting to %s every %s", version, cfg.destination(), cfg.interval())
+	if w := cfg.userWarning(); w != "" {
+		log.Print(w)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -231,7 +291,8 @@ func cmdRun() error {
 // loop reports until ctx ends or Home Assistant deletes the registration.
 // after, if given, runs after each report (the menu uses it to refresh).
 func loop(ctx context.Context, a *agent, after func()) error {
-	a.collector.Read(ctx) // starting point for CPU and network rates
+	defer a.transport.close() // MQTT: offline, before the menu's Quit ends the program
+	a.collector.Read(ctx)     // starting point for CPU and network rates
 	first := time.NewTimer(5 * time.Second)
 	ticker := time.NewTicker(a.cfg.interval())
 	defer ticker.Stop()

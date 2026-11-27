@@ -2,7 +2,7 @@
 
 A small program that reports a computer's load and health to [Home Assistant](https://www.home-assistant.io). It runs on macOS, Windows and Linux, as a menu bar or tray icon, or headless in a container.
 
-It registers with Home Assistant the way the phone app does (the built-in `mobile_app` integration), so each computer becomes a device with its own sensors. No add-on or custom integration is needed.
+Each computer becomes a device in Home Assistant with its own sensors, one of two ways: through an MQTT broker, which Home Assistant finds by [MQTT discovery](#mqtt), or the way the phone app registers (the built-in `mobile_app` integration). No custom integration is needed.
 
 ## What Home Assistant gets
 
@@ -34,7 +34,7 @@ On Windows and macOS each `Disk` sensor also carries the health of the physical 
 
 **Activity** is `Busy` when the median CPU or GPU load over the last four readings (two minutes) is at or above a threshold: 25% CPU or 20% GPU by default. Memory isn't counted, because apps keep memory while idle. A `history_stats` helper in Home Assistant can turn it into hours busy per day.
 
-Readings stop while a computer sleeps; Home Assistant keeps the last value, so a template helper that checks how recent the last report is (`last_reported`) is useful for an on/off status.
+Readings stop while a computer sleeps. Over MQTT its sensors go unavailable about 45 seconds later (its Last Will, below). With mobile_app Home Assistant keeps the last value, so a template helper that checks how recent the last report is (`last_reported`) is useful for an on/off status.
 
 ## Install
 
@@ -44,7 +44,13 @@ Download the build for the computer from the [latest release](https://github.com
 - **Windows:** `familiar-windows.exe`, e.g. as `%LocalAppData%\Programs\familiar\familiar.exe`.
 - **Linux:** `familiar-linux-amd64` or `familiar-linux-arm64`, e.g. as `~/.local/bin/familiar`.
 
-Connect it to Home Assistant with a long-lived access token (Profile → Security), which is used once to register and isn't saved:
+Connect it to Home Assistant through the MQTT broker (see [MQTT](#mqtt)), with the broker user's password on standard input:
+
+```
+op read "op://<vault>/<item>/password" | familiar setup --mqtt-url tcp://homeassistant.local:1883 --name <computer name> --mqtt-password-stdin
+```
+
+Or with mobile_app, using a long-lived access token (Profile → Security), which is used once to register and isn't saved:
 
 ```
 familiar setup --url http://homeassistant.local:8123 --token <token> --name <computer name>
@@ -76,6 +82,38 @@ Installed copies update themselves. A few minutes after starting, and every 6 ho
 
 Then it restarts into the new version. Set `"auto_update": false` (or `FAMILIAR_AUTO_UPDATE=false`) to turn this off. The container image never updates itself; pull a new tag instead.
 
+## MQTT
+
+familiar reports through an MQTT broker (Mosquitto, say) whenever `mqtt_url` is set, and through the webhook otherwise. Home Assistant's [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) finds the computer and its sensors by discovery.
+
+`familiar setup --mqtt-url tcp://<broker>:1883 --name <name> --mqtt-password-stdin` saves the broker, the user, the password and this computer's IDs, then sends a reading to check them. The password comes from standard input, or `FAMILIAR_MQTT_PASSWORD` (handy on Windows), never from a flag. It's kept in the settings file, which only the user can read, the way the webhook ID is. `--mqtt-user` and `--entity-prefix` are optional.
+
+- **`device_id`** names the computer in its topics: a slug of the name (`Office PC` is `office_pc`) unless set. Setup saves it, so renaming the computer later doesn't move it.
+- **`mqtt_user`** is the device ID unless set. Keep them the same where the broker's ACL gives each user only its own topics; familiar warns when they differ:
+  ```
+  pattern readwrite familiar/%u/#
+  pattern readwrite homeassistant/+/%u/#
+  pattern read homeassistant/status
+  ```
+- **`entity_prefix`** starts every entity ID; see below.
+
+Its topics, all retained:
+
+| Topic | |
+|---|---|
+| `familiar/<device_id>/availability` | `online` while it's connected. `offline` when it quits, and as its Last Will, which the broker sends when it loses the computer (about 45 s after it sleeps or crashes). |
+| `familiar/<device_id>/state` | One JSON object per reading: each sensor's state under its ID (`cpu`, `disk_d`, `drive_problem`…; binary sensors are `ON` or `OFF`, and one that has gone away is `null`, so unknown), and its attributes under `attrs.<id>`. |
+| `homeassistant/device/<device_id>/config` | [Device discovery](https://www.home-assistant.io/integrations/mqtt/#device-discovery-payload): the computer, and a component per sensor that reads the state with `{{ value_json.<id> }}`. |
+
+The discovery goes out again whenever it changes (a sensor appears, or Activity's icon follows Busy and Idle), on every connection, and when Home Assistant restarts and says `online` on `homeassistant/status`. familiar reconnects by itself, and while it can't reach the broker the menu says why.
+
+**Entity IDs** are `<platform>.<entity_prefix>_<sensor>`, e.g. `sensor.office_pc_cpu_temperature`, the IDs mobile_app gave them. So a computer moving from mobile_app keeps its entity IDs, and with them its dashboards, automations and history, if its prefix is the one its entities have now: `--entity-prefix office_pc`. The prefix is a slug of the name unless set. Home Assistant only uses the ID when it first adds an entity (it's discovery's `default_entity_id`), and adds `_2` when the ID is taken, so move a computer over in this order:
+
+1. In Home Assistant, delete the computer's Mobile App entry (Settings › Devices & services › Mobile App). That removes its entities, and familiar, finding its registration gone, stops.
+2. `familiar setup --mqtt-url … --name … --entity-prefix <prefix> --mqtt-password-stdin`, then `familiar install` to start it again.
+
+An entity that got `_2` anyway can be renamed in its settings.
+
 ## Container
 
 ```yaml
@@ -87,22 +125,37 @@ services:
     runtime: nvidia             # optional: NVIDIA GPU load and temperature
     read_only: true
     volumes:
-      - ./familiar.json:/config/config.json:ro   # from `familiar setup`, holds the webhook
-      - /srv/storage:/srv/storage:ro             # any other drives to report
+      - ./mqtt_password:/run/secrets/mqtt_password:ro   # readable by the image's user, 65532
+      - /srv/storage:/srv/storage:ro                    # any other drives to report
     environment:
-      FAMILIAR_CONFIG: /config/config.json
-      FAMILIAR_URL: http://192.0.2.10:8123
+      FAMILIAR_MQTT_URL: tcp://192.0.2.10:1883
+      FAMILIAR_MQTT_PASSWORD_FILE: /run/secrets/mqtt_password
       FAMILIAR_NAME: server
+      FAMILIAR_ENTITY_PREFIX: office_server            # keep the entity IDs it has
       FAMILIAR_DISKS: /srv/storage
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: utility
 ```
 
+With MQTT the container needs no settings file. These set it up:
+
+| Variable | |
+|---|---|
+| `FAMILIAR_MQTT_URL` | the broker, `tcp://host:1883` (`ssl://host:8883` for TLS) |
+| `FAMILIAR_MQTT_USER` | default: the device ID |
+| `FAMILIAR_MQTT_PASSWORD_FILE` | a file holding the password, such as a container secret; it wins over `FAMILIAR_MQTT_PASSWORD` |
+| `FAMILIAR_MQTT_PASSWORD` | the password itself |
+| `FAMILIAR_NAME` | the device's name in Home Assistant |
+| `FAMILIAR_DEVICE_ID` | default: a slug of the name |
+| `FAMILIAR_ENTITY_PREFIX` | default: a slug of the name |
+
+For mobile_app instead, mount the `config.json` that `familiar setup` wrote (it holds the webhook) and set `FAMILIAR_CONFIG` to it, with `FAMILIAR_URL` for Home Assistant's address.
+
 In a container `/` is the host's main drive (through the container's own filesystem). Other drives are only visible when mounted.
 
 ## How it talks to Home Assistant
 
-After `setup`, a computer holds only Home Assistant's address and its own webhook ID, which can update that computer's sensors and nothing else. Use an address that works wherever the computer goes (for a laptop, one that's reachable away from home).
+Over MQTT, a computer holds the broker's address and its own broker user and password. With an ACL like the one above, that user can write only this computer's topics. With mobile_app, it holds only Home Assistant's address and its own webhook ID, which can update that computer's sensors and nothing else. Either way the secret stays out of the log and the menu. Use an address that works wherever the computer goes (for a laptop, one that's reachable away from home).
 
 ## CPU temperature on Windows
 

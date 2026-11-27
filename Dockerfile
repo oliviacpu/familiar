@@ -1,7 +1,9 @@
 # familiar as a container: the headless Linux build, reporting the host it runs
 # on. Run with the host's network (for its network rates) and, for an NVIDIA
 # GPU, the NVIDIA runtime. Mount any other drives read-only and list them in
-# FAMILIAR_DISKS.
+# FAMILIAR_DISKS. For MQTT set FAMILIAR_MQTT_URL, FAMILIAR_NAME and the password
+# (FAMILIAR_MQTT_PASSWORD_FILE, a mounted secret); FAMILIAR_DEVICE_ID,
+# FAMILIAR_MQTT_USER and FAMILIAR_ENTITY_PREFIX are optional. See README.md.
 FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
