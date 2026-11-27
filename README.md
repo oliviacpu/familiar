@@ -86,7 +86,7 @@ Then it restarts into the new version. Set `"auto_update": false` (or `FAMILIAR_
 
 familiar reports through an MQTT broker (Mosquitto, say) whenever `mqtt_url` is set, and through the webhook otherwise. Home Assistant's [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) finds the computer and its sensors by discovery.
 
-`familiar setup --mqtt-url tcp://<broker>:1883 --name <name> --mqtt-password-stdin` saves the broker, the user, the password and this computer's IDs, then sends a reading to check them. The password comes from standard input, or `FAMILIAR_MQTT_PASSWORD` (handy on Windows), never from a flag. It's kept in the settings file, which only the user can read, the way the webhook ID is. `--mqtt-user` and `--entity-prefix` are optional.
+`familiar setup --mqtt-url tcp://<broker>:1883 --name <name> --mqtt-password-stdin` saves the broker, the user, the password and this computer's IDs, then sends a reading to check them. It changes only what it's given: the other settings (`auto_update`, `disks`, thresholds) stay, the webhook's too, so removing `mqtt_url` goes back to it, and `--name` can be left out when one is saved. The password comes from standard input, or `FAMILIAR_MQTT_PASSWORD` (handy on Windows), never from a flag. It's kept in the settings file, which only the user can read, the way the webhook ID is. `--mqtt-user` and `--entity-prefix` are optional.
 
 - **`device_id`** names the computer in its topics: a slug of the name (`Office PC` is `office_pc`) unless set. Setup saves it, so renaming the computer later doesn't move it.
 - **`mqtt_user`** is the device ID unless set. Keep them the same where the broker's ACL gives each user only its own topics; familiar warns when they differ:

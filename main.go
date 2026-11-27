@@ -109,20 +109,25 @@ func cmdSetup(args []string) error {
 	if *url == "" {
 		return errors.New("--url is required")
 	}
-	cfg := Config{URL: trimURL(*url), WebhookID: *webhook, Name: *name}
+	saved, err := readConfigFile()
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	if cfg.WebhookID == "" {
+	webhookID := *webhook
+	if webhookID == "" {
 		if *token == "" || *name == "" {
 			return errors.New("give either --webhook, or --token and --name to register")
 		}
-		id, err := registerDevice(ctx, cfg.URL, *token, *name)
+		id, err := registerDevice(ctx, trimURL(*url), *token, *name)
 		if err != nil {
 			return err
 		}
-		cfg.WebhookID = id
+		webhookID = id
 		fmt.Printf("Registered %q in Home Assistant.\n", *name)
 	}
+	cfg := webhookSettings(saved, trimURL(*url), webhookID, *name)
 	if err := saveConfig(cfg); err != nil {
 		return err
 	}
@@ -142,24 +147,30 @@ func cmdSetup(args []string) error {
 // to check them. The password never comes from a flag, which other users of
 // the computer can see: it's read from standard input, or FAMILIAR_MQTT_PASSWORD.
 func setupMQTT(broker, user, name, prefix string, passwordStdin bool) error {
-	if name == "" {
-		return errors.New("--name is required with --mqtt-url")
+	var password *string
+	if v, ok := os.LookupEnv("FAMILIAR_MQTT_PASSWORD"); ok {
+		password = &v
 	}
-	password := os.Getenv("FAMILIAR_MQTT_PASSWORD")
 	if passwordStdin {
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("reading the password: %w", err)
 		}
-		password = strings.TrimRight(line, "\r\n")
+		line = strings.TrimRight(line, "\r\n")
+		password = &line
 	}
-	full := withDefaults(Config{MQTTURL: strings.TrimSpace(broker), MQTTUser: user, MQTTPassword: secret(password), Name: name, EntityPrefix: prefix})
-	if err := full.validate(); err != nil {
+	saved, err := readConfigFile()
+	if err != nil {
 		return err
 	}
-	// The IDs are saved, so renaming the computer later doesn't move its topics or entities.
-	cfg := Config{MQTTURL: full.MQTTURL, MQTTUser: full.MQTTUser, MQTTPassword: full.MQTTPassword, Name: name,
-		DeviceID: full.DeviceID, EntityPrefix: full.EntityPrefix}
+	cfg, err := mqttSettings(saved, broker, user, name, prefix, password)
+	if err != nil {
+		return err
+	}
+	full := withDefaults(cfg)
+	if err := readPasswordFile(&full); err != nil { // the saved password file, when none was given now
+		return err
+	}
 	if err := saveConfig(cfg); err != nil {
 		return err
 	}
@@ -178,6 +189,55 @@ func setupMQTT(broker, user, name, prefix string, passwordStdin bool) error {
 	}
 	fmt.Printf("Sent %d readings to %s as %s (entities %s_…). Next: familiar install\n", n, full.MQTTURL, full.DeviceID, full.EntityPrefix)
 	return nil
+}
+
+// webhookSettings is the saved settings with a mobile_app setup's. The rest
+// stay (auto_update, disks, thresholds…), and MQTT is turned off, since
+// mqtt_url is what picks the transport.
+func webhookSettings(saved Config, url, webhookID, name string) Config {
+	cfg := saved
+	cfg.URL, cfg.WebhookID, cfg.MQTTURL = url, webhookID, ""
+	if name != "" {
+		cfg.Name = name
+	}
+	return cfg
+}
+
+// mqttSettings is the saved settings with an MQTT setup's. The rest stay,
+// the webhook's too (mqtt_url picks the transport, and removing it goes
+// back). So do IDs saved before, so renaming the computer doesn't move its
+// topics or entities. password is nil when none was given: the saved one stays.
+func mqttSettings(saved Config, broker, user, name, prefix string, password *string) (Config, error) {
+	cfg := saved
+	cfg.MQTTURL = strings.TrimSpace(broker)
+	if name != "" {
+		cfg.Name = name
+	}
+	if cfg.Name == "" {
+		return Config{}, errors.New("--name is required with --mqtt-url")
+	}
+	if cfg.DeviceID == "" {
+		cfg.DeviceID = nameSlug(cfg.Name)
+	}
+	if prefix != "" {
+		cfg.EntityPrefix = prefix
+	}
+	if cfg.EntityPrefix = slug(cfg.EntityPrefix); cfg.EntityPrefix == "" {
+		cfg.EntityPrefix = nameSlug(cfg.Name)
+	}
+	if user != "" {
+		cfg.MQTTUser = user
+	}
+	if cfg.MQTTUser == "" {
+		cfg.MQTTUser = cfg.DeviceID
+	}
+	if password != nil {
+		cfg.MQTTPassword, cfg.MQTTPasswordFile = secret(*password), "" // a file would win over it
+	}
+	if err := withDefaults(cfg).validate(); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
 }
 
 func cmdOnce() error {

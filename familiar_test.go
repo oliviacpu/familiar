@@ -9,7 +9,10 @@ import (
 	"hash/fnv"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -213,6 +216,76 @@ func TestApplyEnv(t *testing.T) {
 	cfg = withDefaults(cfg)
 	if cfg.URL != "http://127.0.0.1:8123" || cfg.WebhookID != "abc" || cfg.BusyCPU != 60 || cfg.IntervalSeconds != defaultInterval {
 		t.Errorf("config: %+v", cfg)
+	}
+}
+
+// Setup changes only what its flags set: moving a computer to MQTT mustn't
+// turn auto-update back on, or forget its drives and thresholds.
+func TestSetupKeepsSettings(t *testing.T) {
+	off := false
+	saved := Config{URL: "http://192.0.2.10:8123", WebhookID: "fake-hook", Name: "spellbook", IntervalSeconds: 60,
+		BusyCPU: 40, BusyGPU: 30, BusySamples: 6, DiskPath: "/data", Disks: []string{"/srv/storage"}, AutoUpdate: &off}
+	pw := "fake-pw-not-real"
+	got, err := mqttSettings(saved, "tcp://192.0.2.10:1883", "", "", "macbook", &pw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := saved // url and webhook_id stay: only mqtt_url picks the transport
+	want.MQTTURL, want.MQTTUser, want.MQTTPassword, want.DeviceID, want.EntityPrefix = "tcp://192.0.2.10:1883", "spellbook", secret(pw), "spellbook", "macbook"
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("moving to MQTT:\n got %+v\nwant %+v", got, want)
+	}
+
+	// Again with a new name and no password: the saved password and IDs stay.
+	again, err := mqttSettings(got, "tcp://192.0.2.10:1883", "", "Spell Book", "", nil)
+	if err != nil || again.MQTTPassword != secret(pw) || again.DeviceID != "spellbook" || again.EntityPrefix != "macbook" ||
+		again.MQTTUser != "spellbook" || again.Name != "Spell Book" || again.AutoUpdate != &off {
+		t.Errorf("setup again: %+v %v", again, err)
+	}
+	// A password given now beats a password file saved before.
+	withFile := got
+	withFile.MQTTPasswordFile = "/run/secrets/mqtt_password"
+	if c, _ := mqttSettings(withFile, "tcp://192.0.2.10:1883", "", "", "", &pw); c.MQTTPasswordFile != "" {
+		t.Errorf("the password file would still win: %+v", c)
+	}
+
+	// Back to the webhook: MQTT is off, the rest stays.
+	back := webhookSettings(got, "http://192.0.2.10:8123", "new-fake-hook", "")
+	want = got
+	want.MQTTURL, want.WebhookID = "", "new-fake-hook"
+	if !reflect.DeepEqual(back, want) {
+		t.Errorf("back to mobile_app:\n got %+v\nwant %+v", back, want)
+	}
+}
+
+// saveConfig writes a new file, created 0600, and renames it over the old
+// one: the password is never in a file anyone else can read, even briefly.
+func TestSaveConfigReplacesTheFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	t.Setenv("FAMILIAR_CONFIG", path)
+	if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.Stat(path)
+	if err := saveConfig(Config{MQTTURL: "tcp://192.0.2.10:1883", MQTTPassword: "fake-pw-not-real"}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Error("the old file was rewritten in place, with its old mode until the chmod")
+	}
+	if runtime.GOOS != "windows" && after.Mode().Perm() != 0o600 {
+		t.Errorf("mode %v", after.Mode().Perm())
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Errorf("left behind: %v", entries)
+	}
+	if cfg, err := readConfigFile(); err != nil || cfg.MQTTPassword != "fake-pw-not-real" {
+		t.Errorf("read back: %+v %v", cfg, err)
 	}
 }
 

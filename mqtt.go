@@ -19,11 +19,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	mrand "math/rand/v2"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/eclipse/paho.mqtt.golang/packets"
@@ -148,7 +151,7 @@ func (m *mqtt) onHAStatus(_ paho.Client, msg paho.Message) {
 		if len(m.defs) == 0 {
 			return
 		}
-		if err := m.publishDiscovery(true); err != nil {
+		if err := m.publishDiscovery(true, mqttWait); err != nil {
 			log.Printf("describing this computer to Home Assistant again: %v", err)
 		}
 	}()
@@ -205,11 +208,16 @@ func (m *mqtt) notConnected() error {
 // familiar/<device_id>/. While disconnected it fails rather than queueing:
 // a reading would be stale by the time the broker is back.
 func (m *mqtt) publish(topic string, payload []byte, retained bool) error {
+	return m.publishWithin(mqttWait, topic, payload, retained)
+}
+
+// publishWithin is publish, waiting at most wait for the broker.
+func (m *mqtt) publishWithin(wait time.Duration, topic string, payload []byte, retained bool) error {
 	if m.client == nil || !m.client.IsConnectionOpen() {
 		return m.notConnected()
 	}
 	tok := m.client.Publish(topic, 1, retained, payload)
-	if !tok.WaitTimeout(mqttWait) {
+	if !tok.WaitTimeout(wait) {
 		return errors.New("the MQTT broker didn't confirm a message in time")
 	}
 	if err := tok.Error(); err != nil {
@@ -229,21 +237,22 @@ func (m *mqtt) announce() error {
 	if len(m.defs) == 0 {
 		return nil
 	}
-	return m.publishDiscovery(true)
+	return m.publishDiscovery(true, mqttWait)
 }
 
 // publishDiscovery sends the discovery message if it has changed since the
-// broker last got it, or always with force. m.mu must be held.
+// broker last got it, or always with force, waiting at most wait for the
+// broker. m.mu must be held.
 //
 // It changes when a sensor appears, and when Activity's icon follows it
 // between Busy and Idle (MQTT sensors take their icon only from discovery).
 // Home Assistant leaves the components that didn't change alone.
-func (m *mqtt) publishDiscovery(force bool) error {
+func (m *mqtt) publishDiscovery(force bool, wait time.Duration) error {
 	d := m.discovery()
 	if !force && bytes.Equal(d, m.sent) {
 		return nil
 	}
-	if err := m.publish(m.discoveryTopic, d, true); err != nil {
+	if err := m.publishWithin(wait, m.discoveryTopic, d, true); err != nil {
 		m.sent = nil
 		return err
 	}
@@ -294,13 +303,20 @@ func (m *mqtt) send(ctx context.Context, sensors []Sensor) error {
 	if err != nil {
 		return err
 	}
-	if err := m.publish(m.availTopic, []byte("online"), true); err != nil {
+	// Each message waits no longer than the tick has left.
+	left := func() time.Duration {
+		if dl, ok := ctx.Deadline(); ok {
+			return min(mqttWait, time.Until(dl))
+		}
+		return mqttWait
+	}
+	if err := m.publishWithin(left(), m.availTopic, []byte("online"), true); err != nil {
 		return err
 	}
-	if err := m.publishDiscovery(false); err != nil {
+	if err := m.publishDiscovery(false, left()); err != nil {
 		return err
 	}
-	return m.publish(m.stateTopic, payload, true)
+	return m.publishWithin(left(), m.stateTopic, payload, true)
 }
 
 // mqttState is a sensor's state in the state message. Binary sensors are ON
@@ -324,7 +340,7 @@ func (m *mqtt) close() {
 	}
 	m.mu.Lock()
 	if m.client.IsConnectionOpen() {
-		_ = m.publish(m.availTopic, []byte("offline"), true)
+		_ = m.publishWithin(2*time.Second, m.availTopic, []byte("offline"), true) // quitting shouldn't hang on a silent broker
 	}
 	m.mu.Unlock()
 	m.client.Disconnect(250)
@@ -350,8 +366,8 @@ type haComponent struct {
 	Platform string `json:"platform"`
 	UniqueID string `json:"unique_id"`
 	// DefaultEntityID is the entity ID Home Assistant gives the sensor when
-	// it's first added. It replaced object_id.
-	DefaultEntityID    string `json:"default_entity_id"`
+	// it's first added. It replaced object_id. Left out, HA picks one.
+	DefaultEntityID    string `json:"default_entity_id,omitempty"`
 	Name               string `json:"name"`
 	DeviceClass        string `json:"device_class,omitempty"`
 	Unit               string `json:"unit_of_measurement,omitempty"`
@@ -374,17 +390,37 @@ type haDiscovery struct {
 // discovery is the device discovery message for the sensors described so
 // far. Entity IDs are <platform>.<entity_prefix>_<slug of the name>, which is
 // what mobile_app made them, so a computer moving over can keep its entities.
+//
+// HA turns other scripts into ASCII (Café is cafe) where slug only drops
+// them, so a name that isn't plain ASCII gets no entity ID from familiar,
+// and HA picks one. Neither does a second sensor whose ID the first (by
+// sensor ID) already has, as "Disk バックアップ" would take "Disk"'s.
 func (m *mqtt) discovery() []byte {
+	owner := map[string]string{} // entity ID → the sensor that gets it
+	entityID := func(d definition) string {
+		for _, r := range d.Name {
+			if r >= utf8.RuneSelf {
+				return ""
+			}
+		}
+		if object := slug(d.Name); object != "" {
+			return d.Type + "." + m.prefix + "_" + object
+		}
+		return ""
+	}
+	for _, id := range slices.Sorted(maps.Keys(m.defs)) {
+		if e := entityID(m.defs[id]); e != "" && owner[e] == "" {
+			owner[e] = id
+		}
+	}
 	cmps := map[string]haComponent{}
 	for id, d := range m.defs {
-		object := slug(d.Name)
-		if object == "" {
-			object = slug(id)
-		}
-		c := haComponent{Platform: d.Type, UniqueID: "familiar_" + m.deviceID + "_" + id,
-			DefaultEntityID: d.Type + "." + m.prefix + "_" + object, Name: d.Name,
+		c := haComponent{Platform: d.Type, UniqueID: "familiar_" + m.deviceID + "_" + id, Name: d.Name,
 			DeviceClass: d.DeviceClass, Unit: d.Unit, StateClass: d.StateClass, EntityCategory: d.EntityCategory, Icon: d.Icon,
 			ValueTemplate: "{{ value_json." + id + " }}"}
+		if e := entityID(d); owner[e] == id {
+			c.DefaultEntityID = e
+		}
 		if d.attrs {
 			c.AttributesTopic = m.stateTopic
 			c.AttributesTemplate = "{{ value_json.attrs." + id + " | tojson }}"

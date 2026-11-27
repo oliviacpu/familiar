@@ -78,6 +78,17 @@ func configPath() string {
 }
 
 func loadConfig() (Config, error) {
+	cfg, err := readConfigFile()
+	if err != nil {
+		return cfg, err
+	}
+	applyEnv(&cfg, os.Getenv)
+	return cfg, readPasswordFile(&cfg)
+}
+
+// readConfigFile is the settings file alone, without FAMILIAR_* variables:
+// what setup changes and saves again. No file is no settings.
+func readConfigFile() (Config, error) {
 	var cfg Config
 	data, err := os.ReadFile(configPath())
 	if err == nil {
@@ -87,8 +98,7 @@ func loadConfig() (Config, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return cfg, err
 	}
-	applyEnv(&cfg, os.Getenv)
-	return cfg, readPasswordFile(&cfg)
+	return cfg, nil
 }
 
 // readPasswordFile takes the MQTT password from its file, when there is one.
@@ -285,10 +295,24 @@ func saveConfig(cfg Config) error {
 		return err
 	}
 	data, _ := json.MarshalIndent(cfg, "", "  ")
-	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+	// A new file, 0600 from the start (CreateTemp's mode), renamed over the
+	// old one: the password and webhook ID are never in a file that others
+	// can read, even for a moment.
+	f, err := os.CreateTemp(filepath.Dir(path), ".config-*.json")
+	if err != nil {
 		return err
 	}
-	return os.Chmod(path, 0o600) // WriteFile keeps an existing file's mode
+	_, err = f.Write(append(data, '\n'))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
+	return err
 }
 
 func trimURL(u string) string { return strings.TrimRight(strings.TrimSpace(u), "/") }

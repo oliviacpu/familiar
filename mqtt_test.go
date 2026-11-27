@@ -27,6 +27,7 @@ type fakeBroker struct {
 	user, password string
 
 	mu       sync.Mutex
+	silent   bool // stops confirming messages, like a broker that's hung
 	clients  map[*brokerClient]bool
 	connects []brokerConnect
 	msgs     []brokerMsg
@@ -125,7 +126,12 @@ func (b *fakeBroker) serve(conn net.Conn) {
 			n := int(binary.BigEndian.Uint16(body))
 			topic, rest := string(body[2:2+n]), body[2+n:]
 			if qos > 0 {
-				c.write(0x40, rest[:2]) // PUBACK
+				b.mu.Lock()
+				silent := b.silent
+				b.mu.Unlock()
+				if !silent {
+					c.write(0x40, rest[:2]) // PUBACK
+				}
 				rest = rest[2:]
 			}
 			b.route(brokerMsg{Topic: topic, Payload: string(rest), QoS: qos, Retained: retain})
@@ -668,5 +674,57 @@ func TestMQTTConfig(t *testing.T) {
 	}
 	if id := withDefaults(Config{Name: "ディスク"}).DeviceID; !topicID.MatchString(id) {
 		t.Errorf("device ID from a non-Latin name: %q", id)
+	}
+}
+
+// HA transliterates names into entity IDs (Café is cafe) where slug drops
+// what isn't ASCII. A component whose ID familiar can't make the way HA
+// would, or that two components would share, gets none, and HA picks one.
+func TestMQTTEntityIDClashes(t *testing.T) {
+	b := newFakeBroker(t, "spellbook", fakePassword)
+	m := testMQTT(t, b, fakePassword)
+	sensor := func(id, name string) Sensor { return Sensor{UniqueID: id, Type: "sensor", Name: name, State: 1.0} }
+	err := m.send(context.Background(), []Sensor{
+		sensor("disk", "Disk"),
+		sensor("disk_1a2b3c4d", "Disk バックアップ"), // slugs to disk, like the main disk
+		sensor("disk_2b3c4d5e", "ディスク"),        // slugs to nothing
+		sensor("disk_cafe", "Disk Café"),       // HA would say disk_cafe, slug says disk_caf
+		sensor("fan_a", "Fan A"),
+		sensor("fan_a2", "Fan-A"), // the same entity ID as Fan A
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmps := lastJSON(t, b, discoveryTopic)["components"].(map[string]any)
+	for id, want := range map[string]any{"disk": "sensor.macbook_disk", "fan_a": "sensor.macbook_fan_a",
+		"disk_1a2b3c4d": nil, "disk_2b3c4d5e": nil, "disk_cafe": nil, "fan_a2": nil} {
+		if got := cmps[id].(map[string]any)["default_entity_id"]; got != want {
+			t.Errorf("%s: default_entity_id %v, want %v", id, got, want)
+		}
+	}
+}
+
+// Against a broker that stops answering, a reading gives up when its tick
+// does, and quitting doesn't hang on the goodbye.
+func TestMQTTSilentBroker(t *testing.T) {
+	b := newFakeBroker(t, "spellbook", fakePassword)
+	m := testMQTT(t, b, fakePassword)
+	<-m.settled
+	b.mu.Lock()
+	b.silent = true
+	b.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := m.send(ctx, buildSensors(testReading(), nil, withDefaults(Config{}))); err == nil {
+		t.Error("no confirmation, but no error")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("send took %v with a 1 s deadline", d)
+	}
+	start = time.Now()
+	m.close()
+	if d := time.Since(start); d > 4*time.Second {
+		t.Errorf("close took %v", d)
 	}
 }
